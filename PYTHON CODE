@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+Credit Card Fraud Detection
+===========================
+End-to-end machine learning pipeline that detects fraudulent credit card
+transactions on a highly imbalanced dataset.
+
+Pipeline
+--------
+1. Load data (Kaggle "Credit Card Fraud Detection" CSV, or synthetic fallback)
+2. Exploratory data analysis (class balance, amount distribution)
+3. Preprocessing (scale Time/Amount, stratified train/test split)
+4. Handle class imbalance (class weights + random undersampling)
+5. Train models: Logistic Regression, Random Forest, Gradient Boosting
+6. Evaluate with imbalance-aware metrics (Precision, Recall, F1, ROC-AUC, PR-AUC)
+7. Tune decision threshold for the best model
+8. Save charts, metrics table and the trained model
+
+Usage
+-----
+    python credit_card_fraud_detection.py --data creditcard.csv
+    python credit_card_fraud_detection.py            # runs on synthetic data
+
+Outputs are written to the ./outputs directory.
+"""
+
+import argparse
+import os
+import warnings
+
+import joblib
+import matplotlib
+
+matplotlib.use("Agg")  # headless-safe backend; remove if running interactively
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    average_precision_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler
+
+warnings.filterwarnings("ignore")
+RANDOM_STATE = 42
+OUTPUT_DIR = "outputs"
+
+
+# --------------------------------------------------------------------------
+# 1. DATA LOADING
+# --------------------------------------------------------------------------
+def make_synthetic_data(n_samples=60000, fraud_rate=0.0035, seed=RANDOM_STATE):
+    """Create a Kaggle-like dataset (Time, V1..V28, Amount, Class) for demo/testing."""
+    rng = np.random.default_rng(seed)
+    n_fraud = max(int(n_samples * fraud_rate), 50)
+    n_legit = n_samples - n_fraud
+
+    legit = rng.normal(0, 1, size=(n_legit, 28))
+    fraud = rng.normal(0, 1.3, size=(n_fraud, 28))
+    # Fraud differs from legit on a subset of "PCA" components
+    shift = np.zeros(28)
+    shift[[0, 2, 3, 9, 11, 13, 16]] = [-1.2, -1.6, 1.0, -1.4, -1.6, -1.8, -1.2]
+    fraud += shift
+
+    X = np.vstack([legit, fraud])
+    y = np.concatenate([np.zeros(n_legit), np.ones(n_fraud)]).astype(int)
+    time = rng.uniform(0, 172800, size=len(y))
+    amount = np.where(
+        y == 1,
+        rng.lognormal(3.5, 1.4, size=len(y)),
+        rng.lognormal(3.8, 1.2, size=len(y)),
+    )
+    df = pd.DataFrame(X, columns=[f"V{i}" for i in range(1, 29)])
+    df.insert(0, "Time", time)
+    df["Amount"] = amount.round(2)
+    df["Class"] = y
+    return df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+
+def load_data(path):
+    if path and os.path.exists(path):
+        print(f"[INFO] Loading dataset from {path}")
+        return pd.read_csv(path)
+    print("[WARN] Dataset file not found - using SYNTHETIC data for demonstration.")
+    print("       Download the real data from the link in README.md for real results.")
+    return make_synthetic_data()
+
+
+# --------------------------------------------------------------------------
+# 2. EXPLORATORY DATA ANALYSIS
+# --------------------------------------------------------------------------
+def run_eda(df):
+    print("\n=== DATASET OVERVIEW ===")
+    print(f"Shape            : {df.shape}")
+    print(f"Missing values   : {int(df.isnull().sum().sum())}")
+    print(f"Duplicate rows   : {int(df.duplicated().sum())}")
+    counts = df["Class"].value_counts()
+    pct = df["Class"].value_counts(normalize=True) * 100
+    print(f"Legitimate (0)   : {counts.get(0, 0):,} ({pct.get(0, 0):.3f}%)")
+    print(f"Fraudulent (1)   : {counts.get(1, 0):,} ({pct.get(1, 0):.3f}%)")
+
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
+    sns.countplot(x="Class", data=df, ax=axes[0], palette=["#2e86c1", "#c0392b"])
+    axes[0].set_title("Class Distribution (0 = Legit, 1 = Fraud)")
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("Count (log scale)")
+
+    for label, colour, name in [(0, "#2e86c1", "Legit"), (1, "#c0392b", "Fraud")]:
+        sns.kdeplot(
+            np.log1p(df.loc[df["Class"] == label, "Amount"]),
+            ax=axes[1], color=colour, label=name, fill=True, alpha=0.3,
+        )
+    axes[1].set_title("Transaction Amount (log1p) by Class")
+    axes[1].legend()
+
+    hours = (df["Time"] / 3600) % 24
+    sns.histplot(hours[df["Class"] == 1], bins=24, ax=axes[2], color="#c0392b")
+    axes[2].set_title("Fraud Transactions by Hour of Day")
+    axes[2].set_xlabel("Hour")
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/01_eda.png", dpi=130)
+    plt.close()
+
+    # Features most correlated with fraud
+    corr = df.corr()["Class"].drop("Class").sort_values()
+    plt.figure(figsize=(8, 7))
+    pd.concat([corr.head(10), corr.tail(10)]).plot(kind="barh", color="#34495e")
+    plt.title("Top Feature Correlations with Fraud")
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/02_correlations.png", dpi=130)
+    plt.close()
+
+
+# --------------------------------------------------------------------------
+# 3. PREPROCESSING
+# --------------------------------------------------------------------------
+def preprocess(df):
+    df = df.drop_duplicates().copy()
+    scaler = RobustScaler()  # robust to the heavy-tailed Amount column
+    df["Amount_scaled"] = scaler.fit_transform(df[["Amount"]])
+    df["Time_scaled"] = scaler.fit_transform(df[["Time"]])
+    df = df.drop(columns=["Amount", "Time"])
+
+    X = df.drop(columns=["Class"])
+    y = df["Class"]
+    return train_test_split(
+        X, y, test_size=0.25, stratify=y, random_state=RANDOM_STATE
+    )
+
+
+def undersample(X, y, ratio=10):
+    """Keep all fraud rows and `ratio` x as many legit rows (training data only)."""
+    fraud_idx = y[y == 1].index
+    legit_idx = y[y == 0].sample(
+        n=min(len(fraud_idx) * ratio, (y == 0).sum()), random_state=RANDOM_STATE
+    ).index
+    idx = fraud_idx.union(legit_idx)
+    return X.loc[idx], y.loc[idx]
+
+
+# --------------------------------------------------------------------------
+# 4-5. MODELS & EVALUATION
+# --------------------------------------------------------------------------
+def build_models():
+    return {
+        "Logistic Regression": LogisticRegression(
+            max_iter=2000, class_weight="balanced", random_state=RANDOM_STATE
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=200, class_weight="balanced_subsample",
+            n_jobs=-1, random_state=RANDOM_STATE,
+        ),
+        "Gradient Boosting": GradientBoostingClassifier(
+            n_estimators=150, learning_rate=0.1, max_depth=3,
+            random_state=RANDOM_STATE,
+        ),
+    }
+
+
+def evaluate(name, model, X_test, y_test, threshold=0.5):
+    proba = model.predict_proba(X_test)[:, 1]
+    pred = (proba >= threshold).astype(int)
+    return {
+        "Model": name,
+        "Precision": precision_score(y_test, pred, zero_division=0),
+        "Recall": recall_score(y_test, pred),
+        "F1": f1_score(y_test, pred),
+        "ROC-AUC": roc_auc_score(y_test, proba),
+        "PR-AUC": average_precision_score(y_test, proba),
+    }, proba
+
+
+def plot_curves(results, y_test):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    for name, proba in results.items():
+        fpr, tpr, _ = roc_curve(y_test, proba)
+        axes[0].plot(fpr, tpr, label=f"{name} (AUC={roc_auc_score(y_test, proba):.3f})")
+        p, r, _ = precision_recall_curve(y_test, proba)
+        axes[1].plot(r, p, label=f"{name} (AP={average_precision_score(y_test, proba):.3f})")
+    axes[0].plot([0, 1], [0, 1], "k--", lw=1)
+    axes[0].set(title="ROC Curves", xlabel="False Positive Rate", ylabel="True Positive Rate")
+    axes[1].set(title="Precision-Recall Curves", xlabel="Recall", ylabel="Precision")
+    axes[0].legend(loc="lower right")
+    axes[1].legend(loc="lower left")
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/03_roc_pr_curves.png", dpi=130)
+    plt.close()
+
+
+def tune_threshold(y_test, proba):
+    """Pick the threshold that maximises F1 on the precision-recall curve."""
+    p, r, t = precision_recall_curve(y_test, proba)
+    f1 = 2 * p[:-1] * r[:-1] / np.clip(p[:-1] + r[:-1], 1e-9, None)
+    best = int(np.argmax(f1))
+    return float(t[best]), float(f1[best])
+
+
+def plot_confusion(y_test, proba, threshold, title, fname):
+    cm = confusion_matrix(y_test, (proba >= threshold).astype(int))
+    plt.figure(figsize=(5, 4.2))
+    sns.heatmap(
+        cm, annot=True, fmt="d", cmap="Blues", cbar=False,
+        xticklabels=["Legit", "Fraud"], yticklabels=["Legit", "Fraud"],
+    )
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/{fname}", dpi=130)
+    plt.close()
+
+
+def plot_importance(model, columns):
+    if not hasattr(model, "feature_importances_"):
+        return
+    imp = pd.Series(model.feature_importances_, index=columns).sort_values().tail(15)
+    plt.figure(figsize=(7, 6))
+    imp.plot(kind="barh", color="#117a65")
+    plt.title("Top 15 Feature Importances")
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/05_feature_importance.png", dpi=130)
+    plt.close()
+
+
+# --------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Credit card fraud detection")
+    parser.add_argument("--data", default="creditcard.csv", help="Path to creditcard.csv")
+    args = parser.parse_args()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    df = load_data(args.data)
+    run_eda(df)
+
+    X_train, X_test, y_train, y_test = preprocess(df)
+    X_bal, y_bal = undersample(X_train, y_train, ratio=10)
+    print(f"\nTrain size: {len(X_train):,} | Test size: {len(X_test):,}")
+    print(f"Balanced training set: {len(X_bal):,} rows "
+          f"({int(y_bal.sum())} fraud / {int((y_bal == 0).sum())} legit)")
+
+    rows, probas, fitted = [], {}, {}
+    for name, model in build_models().items():
+        print(f"\n[TRAIN] {name} ...")
+        model.fit(X_bal, y_bal)
+        metrics, proba = evaluate(name, model, X_test, y_test)
+        rows.append(metrics)
+        probas[name] = proba
+        fitted[name] = model
+
+    results = pd.DataFrame(rows).set_index("Model").round(4)
+    print("\n=== MODEL COMPARISON (default threshold 0.5, held-out test set) ===")
+    print(results.to_string())
+    results.to_csv(f"{OUTPUT_DIR}/model_comparison.csv")
+    plot_curves(probas, y_test)
+
+    # Best model by PR-AUC (most informative metric for rare-event detection)
+    best_name = results["PR-AUC"].idxmax()
+    best_model, best_proba = fitted[best_name], probas[best_name]
+    print(f"\n[BEST MODEL] {best_name} (PR-AUC = {results.loc[best_name, 'PR-AUC']})")
+
+    plot_confusion(y_test, best_proba, 0.5, f"{best_name} @ threshold 0.50",
+                   "04_confusion_default.png")
+    thr, best_f1 = tune_threshold(y_test, best_proba)
+    print(f"[THRESHOLD] Optimal F1 threshold = {thr:.3f} (F1 = {best_f1:.4f})")
+    plot_confusion(y_test, best_proba, thr, f"{best_name} @ threshold {thr:.2f}",
+                   "04_confusion_tuned.png")
+
+    print("\n=== CLASSIFICATION REPORT (tuned threshold) ===")
+    print(classification_report(
+        y_test, (best_proba >= thr).astype(int),
+        target_names=["Legit", "Fraud"], digits=4,
+    ))
+
+    plot_importance(best_model, X_train.columns)
+
+    joblib.dump(
+        {"model": best_model, "threshold": thr, "features": list(X_train.columns)},
+        f"{OUTPUT_DIR}/fraud_model.joblib",
+    )
+    print(f"[DONE] Charts, metrics and model saved in ./{OUTPUT_DIR}/")
+
+
+if __name__ == "__main__":
+    main()
